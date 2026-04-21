@@ -1,0 +1,14 @@
+{
+  "name": "tmux-status",
+  "version": "0.1.0",
+  "description": "Reflect live Claude Code session state as a colored dot in the tmux window status line",
+  "author": {
+    "name": "kvaps",
+    "email": "kvapss@gmail.com",
+    "url": "https://github.com/kvaps"
+  },
+  "homepage": "https://github.com/kvaps/claude-plugins/tree/main/hooks/tmux-status",
+  "repository": "https://github.com/kvaps/claude-plugins",
+  "keywords": ["tmux", "session-status", "hooks"],
+  "license": "Apache-2.0"
+}

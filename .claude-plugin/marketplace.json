@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "kvaps-claude-plugins",
+  "description": "Personal collection of Claude Code plugins by kvaps — tmux integration and more",
+  "owner": {
+    "name": "kvaps",
+    "email": "kvapss@gmail.com",
+    "url": "https://github.com/kvaps"
+  },
+  "plugins": [
+    {
+      "name": "tmux-status",
+      "description": "Reflect live Claude Code session state as a colored dot in the tmux window status line",
+      "source": "./hooks/tmux-status",
+      "category": "productivity"
+    }
+  ]
+}
