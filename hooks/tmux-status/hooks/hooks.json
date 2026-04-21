@@ -87,6 +87,17 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tmux-status.sh",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
