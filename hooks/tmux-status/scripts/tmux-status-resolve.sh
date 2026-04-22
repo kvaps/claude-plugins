@@ -23,6 +23,14 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# tmux's #() subshell has a minimal PATH — on macOS `flock` lives in
+# homebrew's util-linux and isn't reachable by default. Without it,
+# our task-lock checks turn into silent false positives (every lock
+# reads as "held" → background detected for every claude). Prepend
+# likely locations so `flock` resolves everywhere.
+PATH="/opt/homebrew/opt/util-linux/bin:/opt/homebrew/bin:/usr/local/opt/util-linux/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export PATH
+
 readonly STATUS_DIR="/tmp/kvaps-tmux-status.$(id -u)"
 [[ -d "${STATUS_DIR}" ]] || exit 0
 
