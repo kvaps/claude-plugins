@@ -157,12 +157,16 @@ has_background() {
   return 1
 }
 
-# Only scan the last JSONL entry — the flag clears naturally once the
-# user sends another message.
+# Scan the last few JSONL entries for a user-interrupt marker. Claude
+# Code emits variations — "[Request interrupted by user]",
+# "[Request interrupted by user for tool use]" — so match the prefix
+# without the closing bracket. The flag clears naturally once claude
+# writes a user-prompt or tool-result entry without the marker past
+# the scan window.
 has_recent_interrupt_marker() {
   local transcript="$1"
   [[ -f "${transcript}" ]] || return 1
-  tail -n 1 "${transcript}" 2>/dev/null | grep -q '\[Request interrupted by user\]'
+  tail -n 5 "${transcript}" 2>/dev/null | grep -q '\[Request interrupted by user'
 }
 
 mtime_of() {
