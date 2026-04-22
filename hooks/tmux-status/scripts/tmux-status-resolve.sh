@@ -100,10 +100,14 @@ has_background() {
   return 1
 }
 
-has_interrupted_marker() {
+# Checks ONLY the last JSONL entry — once the user sends another
+# message, the marker line is no longer the tail, so the flag clears
+# naturally. Avoids getting stuck at error because some earlier turn
+# was interrupted hours ago.
+has_recent_interrupt_marker() {
   local transcript="$1"
   [[ -f "${transcript}" ]] || return 1
-  tail -c 8192 "${transcript}" 2>/dev/null | grep -q '\[Request interrupted by user\]'
+  tail -n 1 "${transcript}" 2>/dev/null | grep -q '\[Request interrupted by user\]'
 }
 
 mtime_of() {
@@ -135,7 +139,7 @@ resolve_status() {
   local interrupted="$7"
 
   # Fast-path for clearly-terminal events.
-  if [[ "${event}" == "StopFailure" ]] || [[ "${interrupted}" -eq 1 ]]; then
+  if [[ "${event}" == "StopFailure" ]]; then
     printf 'error'; return
   fi
   if [[ "${event}" == "SessionStart" ]]; then
@@ -143,6 +147,14 @@ resolve_status() {
   fi
   if [[ "${event}" == "PreCompact" ]]; then
     printf 'background'; return
+  fi
+
+  # A fresh user-interrupt at the tail of the transcript means the turn
+  # just ended from a user action — semantically the same as Stop.
+  # Route through the turn-end branch below so it becomes idle/background
+  # instead of a red "error".
+  if [[ "${interrupted}" -eq 1 ]]; then
+    event="Stop"
   fi
 
   if [[ "${event}" == "Notification" ]]; then
@@ -227,7 +239,7 @@ for status_file in "${STATUS_DIR}"/*.json; do
   fi
 
   interrupted=0
-  has_interrupted_marker "${transcript}" && interrupted=1
+  has_recent_interrupt_marker "${transcript}" && interrupted=1
 
   bg_flag=0
   has_background "${claude_pid}" && bg_flag=1
