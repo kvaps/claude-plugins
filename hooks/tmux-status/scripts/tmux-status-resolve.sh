@@ -1,29 +1,23 @@
 #!/usr/bin/env bash
 #
 # tmux-status resolver: iterates all per-pane state files written by
-# the tmux-status hook and computes the live @claude_status value for
-# each pane, combining:
+# the tmux-status hook, computes a live status per pane, groups panes
+# by window, and sets @claude_status on each window to a pre-rendered
+# string of one colored dot per active claude pane (adjacent, no
+# spaces between). Windows that no longer have any claude pane have
+# @claude_status cleared.
 #
-#   * last hook event + timestamp           (from the state file)
-#   * transcript JSONL mtime                (heartbeat signal — proves
-#                                            the model is streaming
-#                                            output even when no hook
-#                                            has fired for a while)
-#   * CPU% of the claude process            (catches "thinking" —
-#                                            internal reasoning with
-#                                            no streamed output)
-#   * background bash / subagent presence   (Bash run_in_background,
-#                                            ~/.claude/tasks lock)
-#   * transcript tail for an interrupt      ([Request interrupted by
-#                                            user] marker → error)
+# Called periodically from tmux's status-left via #() so state is
+# always fresh — no stale background/working dots when background
+# tasks finish, compact ends, or the model hangs.
 #
-# Called periodically from tmux's status-left/status-right (every
-# status-interval seconds) so state is always fresh — no stale
-# background/working dots left over after a hook fails to fire.
-# Outputs nothing; the side effect is `tmux set-window-option
-# @claude_status` on each tracked pane.
-#
-# Stale panes (file exists but the pane was closed) are cleaned up.
+# Signals combined per pane:
+#   * last hook event + timestamp           (state file)
+#   * transcript JSONL mtime                (heartbeat)
+#   * CPU% of the claude process            (thinking vs working)
+#   * background bash / subagent presence
+#   * last JSONL entry for interrupt marker (routes interrupt back to
+#                                            idle instead of error)
 
 set -o errexit
 set -o nounset
@@ -32,10 +26,12 @@ set -o pipefail
 readonly STATUS_DIR="/tmp/kvaps-tmux-status.$(id -u)"
 [[ -d "${STATUS_DIR}" ]] || exit 0
 
-readonly FRESH_HEARTBEAT_S=3      # heartbeat within this -> "working"
-readonly STALE_HEARTBEAT_S=30     # heartbeat older AND low cpu -> "stuck"
-readonly CPU_ACTIVE_THRESHOLD=1   # cpu% above -> "thinking"
-readonly CPU_IDLE_THRESHOLD=1     # cpu% below -> consider idle/stuck
+readonly FRESH_HEARTBEAT_S=3
+readonly STALE_HEARTBEAT_S=30
+readonly CPU_ACTIVE_THRESHOLD=1
+readonly CPU_IDLE_THRESHOLD=1
+
+readonly PREV_ACTIVE_FILE="${STATUS_DIR}/.prev-active-windows"
 
 now_s="$(date +%s)"
 
@@ -43,8 +39,10 @@ pane_exists() {
   tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1
 }
 
-# Resolve the claude process PID from ~/.claude/sessions/*.json whose
-# sessionId matches. Prints nothing if not found.
+window_of_pane() {
+  tmux display-message -p -t "$1" '#{window_id}' 2>/dev/null || true
+}
+
 find_claude_pid() {
   local sid="$1" f pid
   [[ -z "${sid}" ]] && return
@@ -52,7 +50,6 @@ find_claude_pid() {
     [[ -f "${f}" ]] || continue
     if [[ "$(jq -r '.sessionId // empty' "${f}" 2>/dev/null)" == "${sid}" ]]; then
       pid="$(jq -r '.pid // empty' "${f}" 2>/dev/null)"
-      # Verify process is still alive.
       if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
         printf '%s' "${pid}"
       fi
@@ -61,8 +58,6 @@ find_claude_pid() {
   done
 }
 
-# Integer CPU% of pid (BSD ps returns float like " 12.3"; strip decimal
-# and whitespace, default to 0).
 cpu_pct_int() {
   local pid="$1" raw
   [[ -z "${pid}" ]] && { printf '0'; return; }
@@ -74,7 +69,6 @@ cpu_pct_int() {
 has_background() {
   local claude_pid="$1"
   [[ -z "${claude_pid}" ]] && return 1
-
   local cpid cmd
   while read -r cpid; do
     [[ -z "${cpid}" ]] && continue
@@ -96,14 +90,11 @@ has_background() {
       return 0
     fi
   done
-
   return 1
 }
 
-# Checks ONLY the last JSONL entry — once the user sends another
-# message, the marker line is no longer the tail, so the flag clears
-# naturally. Avoids getting stuck at error because some earlier turn
-# was interrupted hours ago.
+# Only scan the last JSONL entry — the flag clears naturally once the
+# user sends another message.
 has_recent_interrupt_marker() {
   local transcript="$1"
   [[ -f "${transcript}" ]] || return 1
@@ -114,31 +105,10 @@ mtime_of() {
   stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || echo 0
 }
 
-# Resolution table — priority order:
-#
-#   error     StopFailure OR interrupted marker in transcript
-#   starting  SessionStart
-#   background  PreCompact  (compaction in progress)
-#   waiting   Notification that's NOT "waiting for your input"
-#   (turn-end branch: Stop or Notification "waiting for your input")
-#     background  when a bg bash task / subagent is still running
-#     idle        otherwise
-#   (work branch: UserPromptSubmit / PreToolUse / PostToolUse)
-#     working     heartbeat_age < 3s  (model is streaming output)
-#     stuck       heartbeat_age > 30s AND cpu < 1%
-#     thinking    cpu > 1%  (model processing, not streaming)
-#     stuck       ambiguous middle band -> flag for attention
-#   idle      unknown event
 resolve_status() {
-  local event="$1"
-  local event_s="$2"
-  local transcript="$3"
-  local message="$4"
-  local claude_pid="$5"
-  local bg_flag="$6"
-  local interrupted="$7"
+  local event="$1" event_s="$2" transcript="$3" message="$4"
+  local claude_pid="$5" bg_flag="$6" interrupted="$7"
 
-  # Fast-path for clearly-terminal events.
   if [[ "${event}" == "StopFailure" ]]; then
     printf 'error'; return
   fi
@@ -149,10 +119,7 @@ resolve_status() {
     printf 'background'; return
   fi
 
-  # A fresh user-interrupt at the tail of the transcript means the turn
-  # just ended from a user action — semantically the same as Stop.
-  # Route through the turn-end branch below so it becomes idle/background
-  # instead of a red "error".
+  # Interrupt = user took control back = treat like Stop.
   if [[ "${interrupted}" -eq 1 ]]; then
     event="Stop"
   fi
@@ -161,11 +128,9 @@ resolve_status() {
     local msg_lc
     msg_lc="$(printf '%s' "${message}" | tr '[:upper:]' '[:lower:]')"
     case "${msg_lc}" in
-      *"waiting for your input"*) : ;;  # fall through to turn-end logic
+      *"waiting for your input"*) event="Stop" ;;
       *) printf 'waiting'; return ;;
     esac
-    # Treat "waiting for your input" as a turn end.
-    event="Stop"
   fi
 
   if [[ "${event}" == "Stop" ]]; then
@@ -177,7 +142,6 @@ resolve_status() {
     return
   fi
 
-  # Work branch.
   if [[ "${event}" == "UserPromptSubmit" || "${event}" == "PreToolUse" || "${event}" == "PostToolUse" ]]; then
     local heartbeat_s="${event_s}"
     if [[ -n "${transcript}" ]] && [[ -f "${transcript}" ]]; then
@@ -197,15 +161,30 @@ resolve_status() {
     elif [[ "${cpu}" -ge "${CPU_ACTIVE_THRESHOLD}" ]]; then
       printf 'thinking'
     else
-      # Middle band, ambiguous.
       printf 'stuck'
     fi
     return
   fi
 
-  # Unknown event.
   printf 'idle'
 }
+
+color_for_status() {
+  case "$1" in
+    starting|idle)   printf '#00ff00' ;;
+    working)         printf 'yellow' ;;
+    thinking)        printf '#b8860b' ;;
+    background)      printf 'blue' ;;
+    waiting)         printf 'magenta' ;;
+    stuck|error)     printf 'red' ;;
+    *)               printf 'white' ;;
+  esac
+}
+
+# Staging area: per-window dot string accumulator. Use files named
+# after window_id so we don't need associative arrays.
+stage_dir="$(mktemp -d "${STATUS_DIR}/.stage.XXXXXX")"
+trap 'rm -rf "${stage_dir}"' EXIT
 
 for status_file in "${STATUS_DIR}"/*.json; do
   [[ -f "${status_file}" ]] || continue
@@ -229,12 +208,9 @@ for status_file in "${STATUS_DIR}"/*.json; do
 
   claude_pid="$(find_claude_pid "${session_id}")"
 
-  # If the claude process is gone (abrupt quit, no SessionEnd hook),
-  # drop the state file and clear the dot instead of showing stale
-  # "stuck".
+  # If claude died, drop the state file and skip.
   if [[ -z "${claude_pid}" ]] && [[ -n "${session_id}" ]]; then
     rm -f -- "${status_file}"
-    tmux set-window-option -t "${pane_id}" -u @claude_status >/dev/null 2>&1 || true
     continue
   fi
 
@@ -247,6 +223,38 @@ for status_file in "${STATUS_DIR}"/*.json; do
   status="$(resolve_status \
     "${event}" "${event_s}" "${transcript}" "${message}" \
     "${claude_pid}" "${bg_flag}" "${interrupted}")"
+  color="$(color_for_status "${status}")"
 
-  tmux set-window-option -t "${pane_id}" @claude_status "${status}" >/dev/null 2>&1 || true
+  window_id="$(window_of_pane "${pane_id}")"
+  [[ -z "${window_id}" ]] && continue
+
+  # Strip leading @ from window_id so the filename isn't awkward.
+  safe_wid="${window_id//@/w}"
+  printf '#[fg=%s]●' "${color}" >> "${stage_dir}/${safe_wid}"
 done
+
+# Apply per-window renders and record active windows for this pass.
+active_windows=""
+for stage_file in "${stage_dir}"/*; do
+  [[ -f "${stage_file}" ]] || continue
+  safe_wid="$(basename -- "${stage_file}")"
+  window_id="${safe_wid//w/@}"
+  render="$(cat -- "${stage_file}")"
+  tmux set-window-option -t "${window_id}" @claude_status "${render}" >/dev/null 2>&1 || true
+  active_windows="${active_windows}${window_id} "
+done
+
+# Clear @claude_status on windows that had a render last pass but
+# have no active claude panes now.
+prev_active=""
+[[ -f "${PREV_ACTIVE_FILE}" ]] && prev_active="$(cat -- "${PREV_ACTIVE_FILE}")"
+for w in ${prev_active}; do
+  case " ${active_windows} " in
+    *" ${w} "*) : ;;
+    *)
+      tmux set-window-option -t "${w}" -u @claude_status >/dev/null 2>&1 || true
+      ;;
+  esac
+done
+
+printf '%s' "${active_windows}" > "${PREV_ACTIVE_FILE}"

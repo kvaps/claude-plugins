@@ -59,9 +59,15 @@ Add to `~/.tmux.conf` **after** your theme plugin (e.g. after the
 
 ```tmux
 # Claude Code session status indicator
-set -g @claude_status_fmt "#{?@claude_status,#[fg=#{?#{==:#{E:@claude_status},error},red,#{?#{==:#{E:@claude_status},stuck},red,#{?#{==:#{E:@claude_status},waiting},magenta,#{?#{==:#{E:@claude_status},working},yellow,#{?#{==:#{E:@claude_status},thinking},#b8860b,#{?#{==:#{E:@claude_status},background},blue,#00ff00}}}}}}]● #[default],}"
+set -g @claude_status_fmt "#{?@claude_status,#{E:@claude_status} #[default],}"
 run-shell "$HOME/.claude/plugins/marketplaces/kvaps-claude-plugins/hooks/tmux-status/scripts/tmux-install-status-fmt.sh"
 ```
+
+The resolver itself writes a pre-rendered tmux format string like
+`#[fg=yellow]●` (single pane) or `#[fg=yellow]●#[fg=magenta]●` (two
+claude panes in the same window — dots shown side by side, no space
+between). Colors come from the resolver's `color_for_status` function
+— edit that to customize.
 
 Then reload: `tmux source-file ~/.tmux.conf`.
 
@@ -81,13 +87,13 @@ Safe to re-run; idempotent on every `tmux source-file`.
 
 ### Color customization
 
-All colors live in the `@claude_status_fmt` value — swap any of
-`red` / `magenta` / `yellow` / `#b8860b` / `blue` / `#00ff00` for
-your preferred named tmux colors or hex values. `#00ff00` is used
-instead of named `green` because some terminals override the named
-color to a dimmer shade. `#b8860b` (dark goldenrod) gives a visible
-distinction between `working` (bright yellow) and `thinking` (muted
-yellow) without jumping to a completely different hue.
+Colors are set in `scripts/tmux-status-resolve.sh`, in the
+`color_for_status` function. Swap any of `red` / `magenta` / `yellow`
+/ `#b8860b` / `blue` / `#00ff00` for your preferred named tmux colors
+or hex values. `#00ff00` is used instead of named `green` because
+some terminals override the named color to a dimmer shade. `#b8860b`
+(dark goldenrod) gives a visible distinction between `working`
+(bright yellow) and `thinking` (muted yellow).
 
 ### Thresholds
 
