@@ -211,12 +211,18 @@ resolve_status() {
 
     if [[ "${heartbeat_age}" -lt "${FRESH_HEARTBEAT_S}" ]]; then
       printf 'working'
+    elif [[ "${bg_flag}" -eq 1 ]]; then
+      # Not actively streaming but claude has a long-lived child (e.g.
+      # a bash run_in_background server, or a gopls/LSP it spawned).
+      # Surface the bg signal instead of pretending the model is
+      # "thinking" — for the user this means "something's still
+      # running in the background, but claude itself is quiet".
+      printf 'background'
     elif [[ "${heartbeat_age}" -gt "${STALE_HEARTBEAT_S}" ]] && [[ "${cpu}" -lt "${CPU_IDLE_THRESHOLD}" ]]; then
-      # Only flag stuck when the heartbeat is genuinely stale AND the
-      # process is cold. Anything less certain is treated as thinking
-      # so transient gaps in streaming don't flicker the dot to red.
+      # Stale heartbeat + cold CPU = genuinely stuck.
       printf 'stuck'
     else
+      # Transient gaps in streaming (middle band) — still thinking.
       printf 'thinking'
     fi
     return
