@@ -45,10 +45,10 @@ if ! flock -n 9; then
   exit 0
 fi
 
-readonly FRESH_HEARTBEAT_S=3
-readonly STALE_HEARTBEAT_S=30
-readonly CPU_ACTIVE_THRESHOLD=1
-readonly CPU_IDLE_THRESHOLD=1
+readonly FRESH_HEARTBEAT_S=10    # heartbeat within this -> working
+readonly STALE_HEARTBEAT_S=120   # stale AND cold CPU -> stuck (2 min)
+readonly CPU_ACTIVE_THRESHOLD=1  # cpu% above -> thinking
+readonly CPU_IDLE_THRESHOLD=1    # cpu% below in the stale branch -> stuck
 
 readonly PREV_ACTIVE_FILE="${STATUS_DIR}/.prev-active-windows"
 
@@ -161,6 +161,14 @@ resolve_status() {
   local event="$1" event_s="$2" transcript="$3" message="$4"
   local claude_pid="$5" bg_flag="$6" interrupted="$7"
 
+  # Interrupt = user took control back = treat like Stop. Check this
+  # BEFORE the StopFailure short-circuit below, because cancelling a
+  # tool can also fire StopFailure and we don't want that to latch
+  # the dot to red (error) when the user just hit escape.
+  if [[ "${interrupted}" -eq 1 ]]; then
+    event="Stop"
+  fi
+
   if [[ "${event}" == "StopFailure" ]]; then
     printf 'error'; return
   fi
@@ -169,11 +177,6 @@ resolve_status() {
   fi
   if [[ "${event}" == "PreCompact" ]]; then
     printf 'background'; return
-  fi
-
-  # Interrupt = user took control back = treat like Stop.
-  if [[ "${interrupted}" -eq 1 ]]; then
-    event="Stop"
   fi
 
   if [[ "${event}" == "Notification" ]]; then
@@ -209,11 +212,12 @@ resolve_status() {
     if [[ "${heartbeat_age}" -lt "${FRESH_HEARTBEAT_S}" ]]; then
       printf 'working'
     elif [[ "${heartbeat_age}" -gt "${STALE_HEARTBEAT_S}" ]] && [[ "${cpu}" -lt "${CPU_IDLE_THRESHOLD}" ]]; then
+      # Only flag stuck when the heartbeat is genuinely stale AND the
+      # process is cold. Anything less certain is treated as thinking
+      # so transient gaps in streaming don't flicker the dot to red.
       printf 'stuck'
-    elif [[ "${cpu}" -ge "${CPU_ACTIVE_THRESHOLD}" ]]; then
-      printf 'thinking'
     else
-      printf 'stuck'
+      printf 'thinking'
     fi
     return
   fi
