@@ -66,20 +66,42 @@ cpu_pct_int() {
   printf '%s' "${raw%.*}"
 }
 
+# macOS BSD ps prints etime as [[DD-]HH:]MM:SS. Convert to seconds.
+etime_to_s() {
+  local raw="$1"
+  awk -v e="${raw}" 'BEGIN {
+    n = split(e, p, /[-:]/)
+    mults[1] = 1; mults[2] = 60; mults[3] = 3600; mults[4] = 86400
+    total = 0
+    for (i = 0; i < n; i++) total += p[n-i] * mults[i+1]
+    print total
+  }'
+}
+
 has_background() {
   local claude_pid="$1"
   [[ -z "${claude_pid}" ]] && return 1
-  local cpid cmd
+  local cpid cmd etime age
   while read -r cpid; do
     [[ -z "${cpid}" ]] && continue
     cmd="$(ps -p "${cpid}" -o command= 2>/dev/null)"
+    # Filter out known-transient helpers first.
     case "${cmd}" in
       *caffeinate*) continue ;;
       *.claude/hooks/*) continue ;;
       *.claude/local-plugins/*) continue ;;
       *.claude/plugins/marketplaces/*) continue ;;
-      *) return 0 ;;
     esac
+    # A real background task (Bash run_in_background, long-running
+    # service started by claude) lives a while. Short-lived non-system
+    # children are almost always hook invocations running in parallel
+    # with the Stop/Notification event we're resolving — ignore them.
+    etime="$(ps -p "${cpid}" -o etime= 2>/dev/null | tr -d ' ')"
+    age="$(etime_to_s "${etime}")"
+    if [[ -n "${age}" ]] && [[ "${age}" -lt 3 ]]; then
+      continue
+    fi
+    return 0
   done < <(pgrep -P "${claude_pid}" 2>/dev/null)
 
   local lockdir lockfile
