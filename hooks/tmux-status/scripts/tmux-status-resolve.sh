@@ -46,9 +46,7 @@ if ! flock -n 9; then
 fi
 
 readonly FRESH_HEARTBEAT_S=10    # heartbeat within this -> working
-readonly STALE_HEARTBEAT_S=120   # stale AND cold CPU -> stuck (2 min)
-readonly CPU_ACTIVE_THRESHOLD=1  # cpu% above -> thinking
-readonly CPU_IDLE_THRESHOLD=1    # cpu% below in the stale branch -> stuck
+readonly STALE_HEARTBEAT_S=300   # heartbeat older than this -> stuck (5 min)
 
 readonly PREV_ACTIVE_FILE="${STATUS_DIR}/.prev-active-windows"
 
@@ -226,17 +224,16 @@ resolve_status() {
     if [[ "${heartbeat_age}" -lt "${FRESH_HEARTBEAT_S}" ]]; then
       printf 'working'
     elif [[ "${bg_flag}" -eq 1 ]]; then
-      # Not actively streaming but claude has a long-lived child (e.g.
-      # a bash run_in_background server, or a gopls/LSP it spawned).
-      # Surface the bg signal instead of pretending the model is
-      # "thinking" — for the user this means "something's still
-      # running in the background, but claude itself is quiet".
+      # Not streaming, but a user-initiated bg shell task is alive.
       printf 'background'
-    elif [[ "${heartbeat_age}" -gt "${STALE_HEARTBEAT_S}" ]] && [[ "${cpu}" -lt "${CPU_IDLE_THRESHOLD}" ]]; then
-      # Stale heartbeat + cold CPU = genuinely stuck.
+    elif [[ "${heartbeat_age}" -gt "${STALE_HEARTBEAT_S}" ]]; then
+      # Pure time-based stuck: nothing from claude for 5+ minutes.
+      # CPU% used to be part of this check but %cpu from ps oscillates
+      # near 1% and caused the dot to flicker between red/yellow —
+      # drop that signal entirely, time is the more reliable one.
       printf 'stuck'
     else
-      # Transient gaps in streaming (middle band) — still thinking.
+      # Middle band (FRESH..STALE) = still thinking.
       printf 'thinking'
     fi
     return

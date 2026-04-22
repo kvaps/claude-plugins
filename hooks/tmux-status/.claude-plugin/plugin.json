@@ -1,6 +1,6 @@
 {
   "name": "tmux-status",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Reflect live Claude Code session state as a colored dot in the tmux window status line",
   "author": {
     "name": "kvaps",
