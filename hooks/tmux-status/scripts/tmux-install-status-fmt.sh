@@ -1,28 +1,41 @@
 #!/usr/bin/env bash
 #
-# Inject #{E:@claude_status_fmt} into window-status-format and
-# window-status-current-format so a colored dot appears INSIDE the
-# active-tab decoration (between the theme's opening style and the
-# window name).
+# Install tmux-status' glue into the current tmux server config:
 #
-# Strategy: split the format at the first "#I:" and inject
+#   1. Inject #{E:@claude_status_fmt} into window-status-format and
+#      window-status-current-format right before "#I:", duplicating any
+#      #[...] style directives from the theme's prefix so the dot's
+#      #[default] reset doesn't bleed the theme's fg/bg onto the
+#      window name. Non-style chars (powerline arrows, etc.) are left
+#      in place, not duplicated.
 #
-#   <original-prefix> MARKER <extracted-styles> <rest>
+#   2. Install tmux-status-resolve.sh as a "#(...)" probe in
+#      status-left. The probe is invisible but runs every
+#      status-interval seconds (side effect only: updates
+#      @claude_status on every claude-tracked pane). This makes the
+#      dot auto-correct when background tasks complete, when the
+#      model gets stuck, etc. — without needing a new hook event.
 #
-# where MARKER = #{E:@claude_status_fmt} and <extracted-styles> is the
-# concatenation of all #[...] blocks found in the prefix. The dot uses
-# #[default] to reset, and the extracted styles re-apply the theme's
-# fg/bg/attrs immediately after — without re-drawing any non-style
-# characters (like powerline arrows) that sat between the blocks.
+#   3. Lower status-interval to 2s if it's higher, so the probe
+#      actually runs at a useful cadence.
 #
-# Idempotent — if the marker is already in the format, skip.
+# Idempotent — safe to re-run on every tmux config reload. Must run
+# AFTER the user's theme plugin so it extends the theme's format
+# instead of being overwritten by it.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-marker='#{E:@claude_status_fmt}'
+readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly RESOLVER="${SCRIPT_DIR}/tmux-status-resolve.sh"
 
+marker='#{E:@claude_status_fmt}'
+probe_marker='#{E:@claude_status_probe}'
+
+#
+# 1. Inject into window-status-format / window-status-current-format.
+#
 for opt in window-status-format window-status-current-format; do
   cur="$(tmux show-option -gv "${opt}")"
   case "${cur}" in
@@ -33,8 +46,6 @@ for opt in window-status-format window-status-current-format; do
     *'#I:'*)
       prefix="${cur%%#I:*}"
       suffix="#I:${cur#*#I:}"
-      # Extract all #[...] blocks from the prefix, joined, with no
-      # other chars (so arrows/spaces/etc. aren't duplicated).
       restore="$(printf '%s' "${prefix}" | grep -Eo '#\[[^]]*\]' | tr -d '\n' || true)"
       new="${prefix}${marker}${restore}${suffix}"
       ;;
@@ -45,3 +56,24 @@ for opt in window-status-format window-status-current-format; do
 
   tmux set-option -g "${opt}" "${new}"
 done
+
+#
+# 2. Install the resolver probe on status-left.
+#
+tmux set-option -g @claude_status_probe "#(${RESOLVER})"
+
+cur_status_left="$(tmux show-option -gv status-left 2>/dev/null || true)"
+case "${cur_status_left}" in
+  *'@claude_status_probe'*) ;;  # already present
+  *)
+    tmux set-option -g status-left "${probe_marker}${cur_status_left}"
+    ;;
+esac
+
+#
+# 3. Ensure status-interval is fast enough for the probe to feel live.
+#
+cur_interval="$(tmux show-option -gv status-interval 2>/dev/null || echo 15)"
+if [[ "${cur_interval}" -gt 2 ]] || [[ "${cur_interval}" -lt 1 ]]; then
+  tmux set-option -g status-interval 2
+fi

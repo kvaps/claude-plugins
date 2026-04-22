@@ -1,146 +1,71 @@
 #!/usr/bin/env bash
 #
-# tmux-status: reflect Claude Code session state in the current tmux window.
+# tmux-status hook: records a raw event for the current pane into a
+# per-pane JSON file, so tmux-status-resolve.sh (called periodically
+# from tmux's status-interval tick) can compute the live state using
+# additional signals (transcript mtime, CPU%, background tasks).
 #
-# Writes a per-window user option @claude_status that tmux.conf formats
-# into a small colored dot in window-status-format. On SessionEnd it
-# clears the option so the dot disappears.
+# State file: ~/.claude/tmux-status/<pane_id>.json
 #
-# Status values: starting | working | waiting | background | idle | error
+# On SessionEnd the file is removed and @claude_status is cleared.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
 # Nothing to do outside a tmux session.
-if [[ -z "${TMUX:-}" ]]; then
+if [[ -z "${TMUX:-}" ]] || [[ -z "${TMUX_PANE:-}" ]]; then
   exit 0
 fi
 
-# Target the pane claude is running in, not the currently-focused window.
-# TMUX_PANE is exported by tmux into every pane's shell and inherited by
-# child processes — so the hook, spawned by claude, sees claude's pane.
-target=()
-if [[ -n "${TMUX_PANE:-}" ]]; then
-  target=(-t "${TMUX_PANE}")
-fi
+readonly STATUS_DIR="/tmp/kvaps-tmux-status.$(id -u)"
+mkdir -p -- "${STATUS_DIR}"
+
+# Sanitize pane_id for filename — pane IDs look like "%42".
+pane_id="${TMUX_PANE}"
+# Escape the leading % — in bash/zsh, an unescaped % at the start of
+# a substitution pattern is treated as an end-anchor, not a literal.
+file_id="${pane_id//\%/pct}"
+status_file="${STATUS_DIR}/${file_id}.json"
 
 input="$(cat)"
 
 event="$(jq --raw-output '.hook_event_name // empty' <<<"${input}")"
 session_id="$(jq --raw-output '.session_id // empty' <<<"${input}")"
+cwd="$(jq --raw-output '.cwd // empty' <<<"${input}")"
+transcript_path="$(jq --raw-output '.transcript_path // empty' <<<"${input}")"
 message="$(jq --raw-output '.message // empty' <<<"${input}")"
 
 if [[ -z "${event}" ]]; then
   exit 0
 fi
 
-# SessionEnd: clear status option so the dot disappears.
+# SessionEnd: clean up and clear the window option.
 if [[ "${event}" == "SessionEnd" ]]; then
-  tmux set-window-option "${target[@]}" -u @claude_status >/dev/null 2>&1 || true
+  rm -f -- "${status_file}"
+  tmux set-window-option -t "${pane_id}" -u @claude_status >/dev/null 2>&1 || true
   exit 0
 fi
 
-# Detect whether claude currently has any background activity:
-#   1. Non-system child processes of the claude PID (catches Bash run_in_background)
-#   2. Any ~/.claude/tasks/<uuid>/.lock held exclusively (catches background agent tasks)
-# Returns 0 (true) if anything is found, 1 otherwise.
-has_background() {
-  local sid="${1:-}"
-  [[ -z "${sid}" ]] && return 1
+now_s="$(date +%s)"
 
-  # Resolve claude PID via the session state file whose sessionId matches.
-  local claude_pid="" f
-  for f in "${HOME}"/.claude/sessions/*.json; do
-    [[ -f "${f}" ]] || continue
-    if [[ "$(jq -r '.sessionId // empty' "${f}" 2>/dev/null)" == "${sid}" ]]; then
-      claude_pid="$(jq -r '.pid // empty' "${f}" 2>/dev/null)"
-      break
-    fi
-  done
-
-  if [[ -n "${claude_pid}" ]]; then
-    # Exclude the zsh wrapper that spawned this hook script — it's a
-    # transient child of claude, not a background task.
-    local my_wrapper_pid
-    my_wrapper_pid="$(ps -p $$ -o ppid= 2>/dev/null | tr -d ' ')"
-
-    local cpid cmd
-    while read -r cpid; do
-      [[ -z "${cpid}" ]] && continue
-      [[ "${cpid}" == "${my_wrapper_pid}" ]] && continue
-      cmd="$(ps -p "${cpid}" -o command= 2>/dev/null)"
-      case "${cmd}" in
-        *caffeinate*) continue ;;
-        *.claude/hooks/*) continue ;;
-        *) return 0 ;;
-      esac
-    done < <(pgrep -P "${claude_pid}" 2>/dev/null)
-  fi
-
-  # Background agent tasks hold an exclusive flock on their .lock file
-  # while active. If we can grab a shared lock non-blockingly, nothing
-  # holds it (task idle).
-  local lockdir lockfile
-  for lockdir in "${HOME}"/.claude/tasks/*/; do
-    lockfile="${lockdir}.lock"
-    [[ -f "${lockfile}" ]] || continue
-    if ! flock -n -s "${lockfile}" -c true 2>/dev/null; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-turn_end_status() {
-  if has_background "${session_id}"; then
-    printf 'background'
-  else
-    printf 'idle'
-  fi
-}
-
-status=""
-case "${event}" in
-  SessionStart)
-    status="starting"
-    ;;
-  UserPromptSubmit | PreToolUse | PostToolUse)
-    status="working"
-    ;;
-  PreCompact)
-    # Compaction is a long-running background operation blocking the
-    # model. Flag it as "background" (blue) so the user sees a distinct
-    # state from plain working yellow. The next hook event (PreToolUse /
-    # Stop / Notification) naturally overwrites when compaction is done.
-    status="background"
-    ;;
-  Stop)
-    status="$(turn_end_status)"
-    ;;
-  Notification)
-    # Claude Code fires Notification both for "waiting for your input"
-    # after a plain turn (semantically a turn end) and for real blocking
-    # gates (permission prompt, plan approval, elicitation). Only the
-    # latter need the user's active attention — those get "waiting".
-    # Lowercase via tr: ${var,,} is Bash 4+, macOS ships 3.2.
-    message_lc="$(printf '%s' "${message}" | tr '[:upper:]' '[:lower:]')"
-    case "${message_lc}" in
-      *"waiting for your input"*)
-        status="$(turn_end_status)"
-        ;;
-      *)
-        status="waiting"
-        ;;
-    esac
-    ;;
-  StopFailure)
-    status="error"
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-
-tmux set-window-option "${target[@]}" @claude_status "${status}" >/dev/null 2>&1 || true
+# Atomic write via tmp+rename so the resolver never reads a half-written
+# file.
+jq --null-input \
+  --arg pane "${pane_id}" \
+  --arg sid "${session_id}" \
+  --arg cwd "${cwd}" \
+  --arg transcript "${transcript_path}" \
+  --arg event "${event}" \
+  --arg message "${message}" \
+  --argjson now "${now_s}" \
+  '{
+    pane_id:         $pane,
+    session_id:      $sid,
+    cwd:             $cwd,
+    transcript_path: $transcript,
+    last_event:      $event,
+    message:         $message,
+    last_event_s:    $now
+  }' >"${status_file}.tmp.$$" \
+  && mv "${status_file}.tmp.$$" "${status_file}"
