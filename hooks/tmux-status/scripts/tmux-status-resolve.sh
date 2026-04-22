@@ -26,6 +26,17 @@ set -o pipefail
 readonly STATUS_DIR="/tmp/kvaps-tmux-status.$(id -u)"
 [[ -d "${STATUS_DIR}" ]] || exit 0
 
+# Mutex: only one resolver run at a time. If tmux's probe fires again
+# while we're still working, skip — the next tick will pick it up.
+# Without this, concurrent runs race on @claude_status and can leave
+# stale values (e.g. blue when a previous run detected a transient
+# bg child).
+readonly LOCK_FILE="${STATUS_DIR}/.resolver.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  exit 0
+fi
+
 readonly FRESH_HEARTBEAT_S=3
 readonly STALE_HEARTBEAT_S=30
 readonly CPU_ACTIVE_THRESHOLD=1
@@ -104,10 +115,21 @@ has_background() {
     return 0
   done < <(pgrep -P "${claude_pid}" 2>/dev/null)
 
-  local lockdir lockfile
+  # Task dirs accumulate historically (user's system has 39+); most are
+  # long-dead. Only probe ones whose .highwatermark has been touched
+  # within the last hour — an active agent writes to it continuously,
+  # dormant ones won't.
+  local lockdir lockfile hwfile hw_age
+  local now_s
+  now_s="$(date +%s)"
   for lockdir in "${HOME}"/.claude/tasks/*/; do
     lockfile="${lockdir}.lock"
+    hwfile="${lockdir}.highwatermark"
     [[ -f "${lockfile}" ]] || continue
+    if [[ -f "${hwfile}" ]]; then
+      hw_age=$(( now_s - $(mtime_of "${hwfile}") ))
+      [[ "${hw_age}" -gt 3600 ]] && continue
+    fi
     if ! flock -n -s "${lockfile}" -c true 2>/dev/null; then
       return 0
     fi
