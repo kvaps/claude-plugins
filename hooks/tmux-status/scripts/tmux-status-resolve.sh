@@ -227,13 +227,12 @@ resolve_status() {
 
 color_for_status() {
   case "$1" in
-    starting|idle)   printf '#00ff00' ;;
-    working)         printf 'yellow' ;;
-    thinking)        printf '#b8860b' ;;
-    background)      printf 'blue' ;;
-    waiting)         printf 'magenta' ;;
-    stuck|error)     printf 'red' ;;
-    *)               printf 'white' ;;
+    starting|idle)     printf '#00ff00' ;;
+    working|thinking)  printf 'yellow' ;;
+    background)        printf 'blue' ;;
+    waiting)           printf 'magenta' ;;
+    stuck|error)       printf 'red' ;;
+    *)                 printf 'white' ;;
   esac
 }
 
