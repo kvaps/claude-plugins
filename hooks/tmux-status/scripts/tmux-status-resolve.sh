@@ -100,21 +100,35 @@ etime_to_s() {
 has_background() {
   local claude_pid="$1"
   [[ -z "${claude_pid}" ]] && return 1
-  local cpid cmd etime age
+  local cpid cmd etime age exe_base
   while read -r cpid; do
     [[ -z "${cpid}" ]] && continue
     cmd="$(ps -p "${cpid}" -o command= 2>/dev/null)"
-    # Filter out known-transient helpers first.
+
+    # The user's mental model of "background" is a user-initiated
+    # task running in the shell: Bash tool with run_in_background=true
+    # ends up as /bin/bash -c "<cmd>" (or similar) under claude.
+    # Internal helpers claude spawns for its own workflow (LSPs like
+    # gopls, language servers, hook runners, caffeinate, etc.) don't
+    # belong here — the user doesn't see them "running". Only count
+    # direct shell children.
+    exe_base="$(printf '%s\n' "${cmd}" | awk '{print $1}')"
+    exe_base="${exe_base##*/}"
+    case "${exe_base}" in
+      bash|sh|zsh|dash|fish|ksh) : ;;
+      *) continue ;;
+    esac
+
+    # Skip our own hook wrappers and other plugins' hooks explicitly.
     case "${cmd}" in
-      *caffeinate*) continue ;;
       *.claude/hooks/*) continue ;;
       *.claude/local-plugins/*) continue ;;
       *.claude/plugins/marketplaces/*) continue ;;
     esac
-    # A real background task (Bash run_in_background, long-running
-    # service started by claude) lives a while. Short-lived non-system
-    # children are almost always hook invocations running in parallel
-    # with the Stop/Notification event we're resolving — ignore them.
+
+    # Short-lived shells are still likely a synchronous Bash tool call
+    # finishing, or a concurrent hook's bash wrapper. Real user bg
+    # services (`npm run dev &`, servers, etc.) live much longer.
     etime="$(ps -p "${cpid}" -o etime= 2>/dev/null | tr -d ' ')"
     age="$(etime_to_s "${etime}")"
     if [[ -n "${age}" ]] && [[ "${age}" -lt 3 ]]; then
