@@ -310,13 +310,19 @@ for status_file in "${STATUS_DIR}"/*.json; do
 done
 
 # Apply per-window renders and record active windows for this pass.
+# Only call set-window-option when the value actually changed —
+# every set forces tmux to mark the window dirty and redraw the
+# status bar, which can disturb terminal-level mouse selection.
 active_windows=""
 for stage_file in "${stage_dir}"/*; do
   [[ -f "${stage_file}" ]] || continue
   safe_wid="$(basename -- "${stage_file}")"
   window_id="${safe_wid//w/@}"
   render="$(cat -- "${stage_file}")"
-  tmux set-window-option -t "${window_id}" @claude_status "${render}" >/dev/null 2>&1 || true
+  cur="$(tmux show-window-options -t "${window_id}" -v @claude_status 2>/dev/null || true)"
+  if [[ "${cur}" != "${render}" ]]; then
+    tmux set-window-option -t "${window_id}" @claude_status "${render}" >/dev/null 2>&1 || true
+  fi
   active_windows="${active_windows}${window_id} "
 done
 
@@ -328,7 +334,10 @@ for w in ${prev_active}; do
   case " ${active_windows} " in
     *" ${w} "*) : ;;
     *)
-      tmux set-window-option -t "${w}" -u @claude_status >/dev/null 2>&1 || true
+      cur="$(tmux show-window-options -t "${w}" -v @claude_status 2>/dev/null || true)"
+      if [[ -n "${cur}" ]]; then
+        tmux set-window-option -t "${w}" -u @claude_status >/dev/null 2>&1 || true
+      fi
       ;;
   esac
 done
